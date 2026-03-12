@@ -247,9 +247,8 @@ def calculate_breadth_high_low_adline_volume() -> dict:
     ad_line_latest = 0
     ad_line_20d_change = None
     if not closes_df.empty and len(closes_df) >= 25:
-        adv_decl = closes_df.diff().applymap(
-            lambda x: 1 if pd.notna(x) and x > 0 else (-1 if pd.notna(x) and x < 0 else 0)
-        )
+        diff = closes_df.diff()
+        adv_decl = (diff > 0).astype(int) - (diff < 0).astype(int)
         daily_ad = adv_decl.sum(axis=1)
         ad_line = daily_ad.cumsum()
         ad_line_latest = int(ad_line.iloc[-1])
