@@ -7,12 +7,45 @@ import requests
 import yfinance as yf
 
 
+# ================================
+# 환경 변수
+# ================================
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 PRICE_HISTORY_PERIOD = "1y"
-RET_3M_LOOKBACK = 63
+VIX_PERIOD = "6mo"
 
+RET_3M = 63
+RET_6M = 126
+
+SP500_UNIVERSE_CSV = "data/sp500_universe.csv"
+
+
+# ================================
+# 섹터 ETF
+# ================================
+
+SECTOR_ETFS = {
+    "반도체": "SMH",
+    "소프트웨어": "IGV",
+    "기술주": "XLK",
+    "산업재": "XLI",
+    "금융": "XLF",
+    "헬스케어": "XLV",
+    "에너지": "XLE",
+    "소비재(임의소비)": "XLY",
+    "필수소비재": "XLP",
+    "커뮤니케이션": "XLC",
+    "소재": "XLB",
+    "유틸리티": "XLU",
+}
+
+
+# ================================
+# 대표 리더 (11섹터)
+# ================================
 
 LEADERS: Dict[str, Dict] = {
     "MSFT": {"name": "마이크로소프트", "sector": "기술"},
@@ -29,7 +62,12 @@ LEADERS: Dict[str, Dict] = {
 }
 
 
+# ================================
+# 텔레그램
+# ================================
+
 def send_telegram(text: str):
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(text)
         return
@@ -45,55 +83,81 @@ def send_telegram(text: str):
     requests.post(url, json=payload, timeout=30)
 
 
+# ================================
+# 유틸
+# ================================
+
 def safe_float(x) -> Optional[float]:
+
     try:
         if x is None or pd.isna(x):
             return None
         return float(x)
-    except Exception:
+    except:
         return None
 
 
-def pct(v: Optional[float]) -> str:
+def pct(v):
+
     if v is None:
         return "-"
+
     return f"{v*100:.1f}%"
 
 
-def short_number(x: Optional[float]) -> str:
-    if x is None:
+def num(v):
+
+    if v is None:
         return "-"
-    if abs(x) >= 1_000_000_000:
-        return f"{x/1_000_000_000:.2f}B"
-    if abs(x) >= 1_000_000:
-        return f"{x/1_000_000:.2f}M"
-    return f"{x:.2f}"
+
+    return f"{v:.2f}"
 
 
-def download_series(ticker: str):
+def compact(v):
+
+    if v is None:
+        return "-"
+
+    v = float(v)
+
+    if abs(v) >= 1_000_000_000:
+        return f"{v/1_000_000_000:.2f}B"
+
+    if abs(v) >= 1_000_000:
+        return f"{v/1_000_000:.2f}M"
+
+    if abs(v) >= 1_000:
+        return f"{v/1_000:.2f}K"
+
+    return f"{v:.2f}"
+
+
+# ================================
+# 데이터 다운로드
+# ================================
+
+def download_series(ticker, period):
 
     df = yf.download(
         ticker,
-        period=PRICE_HISTORY_PERIOD,
+        period=period,
         progress=False,
         auto_adjust=True,
     )
 
-    if df.empty:
-        raise RuntimeError(f"{ticker} 데이터 없음")
-
     close = df["Close"]
 
-    # 환경에 따라 DataFrame으로 오는 경우 처리
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
 
-    close = pd.Series(close).dropna()
-
-    return close
+    return close.dropna()
 
 
-def ma(series: pd.Series, n: int):
+# ================================
+# 이동평균
+# ================================
+
+def ma(series, n):
 
     if len(series) < n:
         return None
@@ -101,161 +165,310 @@ def ma(series: pd.Series, n: int):
     return safe_float(series.rolling(n).mean().iloc[-1])
 
 
-def ret(series: pd.Series, lookback: int):
+# ================================
+# 수익률
+# ================================
+
+def ret(series, lookback):
 
     if len(series) <= lookback:
         return None
 
-    start = safe_float(series.iloc[-lookback - 1])
+    start = safe_float(series.iloc[-lookback])
     end = safe_float(series.iloc[-1])
 
-    if start is None or end is None or start <= 0:
+    if start is None or end is None:
         return None
 
-    return (end / start) - 1
+    return (end/start) - 1
 
 
-def leader_analysis():
+# ================================
+# Breadth
+# ================================
 
-    rows = []
+def get_sp500():
+
+    df = pd.read_csv(SP500_UNIVERSE_CSV)
+
+    return df["ticker"].tolist()
+
+
+def breadth():
+
+    tickers = get_sp500()
 
     above50 = 0
     above200 = 0
-    retpos = 0
 
-    for ticker, info in LEADERS.items():
+    new_high = 0
+    new_low = 0
 
-        s = download_series(ticker)
+    closes = {}
+    volumes = {}
 
-        close = safe_float(s.iloc[-1])
-        ma50 = ma(s, 50)
-        ma200 = ma(s, 200)
-        r3 = ret(s, RET_3M_LOOKBACK)
+    for t in tickers:
 
-        a50 = close > ma50 if ma50 else False
-        a200 = close > ma200 if ma200 else False
+        try:
 
-        if a50:
-            above50 += 1
+            s = download_series(t, PRICE_HISTORY_PERIOD)
 
-        if a200:
-            above200 += 1
+            closes[t] = s
 
-        if r3 and r3 > 0:
-            retpos += 1
+            if len(s) >= 50:
 
-        rows.append(
-            {
-                "ticker": ticker,
-                "name": info["name"],
-                "sector": info["sector"],
-                "a50": a50,
-                "a200": a200,
-                "ret3": r3,
-            }
-        )
+                last = s.iloc[-1]
 
-    return rows, above50, above200, retpos
+                if last > s.rolling(50).mean().iloc[-1]:
+                    above50 += 1
 
+                if last > s.rolling(200).mean().iloc[-1]:
+                    above200 += 1
 
-def leader_interpret(a200: int):
+            if len(s) >= 252:
 
-    if a200 >= 9:
-        return "리더 구조 매우 강함"
+                if s.iloc[-1] >= s[-252:].max():
+                    new_high += 1
 
-    if a200 >= 6:
-        return "리더 구조 정상"
+                if s.iloc[-1] <= s[-252:].min():
+                    new_low += 1
 
-    if a200 >= 4:
-        return "리더 약화 시작"
+        except:
+            pass
 
-    return "리더 붕괴"
+    total = len(closes)
+
+    return {
+        "above50": above50,
+        "above200": above200,
+        "total": total,
+        "high": new_high,
+        "low": new_low,
+        "pct50": above50/total if total else None,
+        "pct200": above200/total if total else None
+    }
 
 
-def build_report():
+# ================================
+# 리더 분석
+# ================================
 
-    spy = download_series("SPY")
-    qqq = download_series("QQQ")
-    vix = download_series("^VIX")
+def leader_status():
 
-    spy_close = safe_float(spy.iloc[-1])
-    qqq_close = safe_float(qqq.iloc[-1])
-    vix_close = safe_float(vix.iloc[-1])
+    rows = []
 
-    spy50 = ma(spy, 50)
-    spy200 = ma(spy, 200)
+    for t, info in LEADERS.items():
 
-    qqq50 = ma(qqq, 50)
-    qqq200 = ma(qqq, 200)
+        s = download_series(t, PRICE_HISTORY_PERIOD)
 
-    leaders, a50, a200, rpos = leader_analysis()
+        close = s.iloc[-1]
 
-    regime = "GO"
+        ma50 = ma(s,50)
+        ma200 = ma(s,200)
 
-    if spy_close < spy200 or qqq_close < qqq200:
-        regime = "STOP"
+        r3 = ret(s,RET_3M)
 
-    if vix_close >= 30:
-        regime = "STOP"
+        rows.append({
+            "ticker":t,
+            "name":info["name"],
+            "sector":info["sector"],
+            "a50": close>ma50 if ma50 else False,
+            "a200": close>ma200 if ma200 else False,
+            "ret3":r3
+        })
 
-    leader_comment = leader_interpret(a200)
+    return rows
+
+
+# ================================
+# 섹터 강도
+# ================================
+
+def sector_strength():
+
+    rows=[]
+
+    for name,t in SECTOR_ETFS.items():
+
+        s = download_series(t,PRICE_HISTORY_PERIOD)
+
+        r3 = ret(s,RET_3M)
+        r6 = ret(s,RET_6M)
+
+        score = (r3 or 0)*0.45 + (r6 or 0)*0.55
+
+        rows.append({
+            "sector":name,
+            "ticker":t,
+            "r3":r3,
+            "r6":r6,
+            "score":score
+        })
+
+    rows.sort(key=lambda x:x["score"],reverse=True)
+
+    return rows
+
+
+# ================================
+# 판정
+# ================================
+
+def classify(spy_close,spy50,spy200,qqq_close,qqq50,qqq200,vix,breadth_pct,leaders):
+
+    stop=False
+    watch=False
+
+    leader200=sum(1 for r in leaders if r["a200"])
+
+    if breadth_pct is not None and breadth_pct<0.30:
+        stop=True
+
+    if vix>=30:
+        stop=True
+
+    if spy_close<spy200 or qqq_close<qqq200:
+        stop=True
+
+    if leader200<=2:
+        stop=True
+
+    if breadth_pct is not None and breadth_pct<0.45:
+        watch=True
+
+    if vix>=22:
+        watch=True
+
+    if spy_close<spy50 or qqq_close<qqq50:
+        watch=True
+
+    if stop:
+        return "STOP"
+
+    if watch:
+        return "WATCH"
+
+    return "GO"
+
+
+# ================================
+# 리포트 생성
+# ================================
+
+def build():
+
+    spy = download_series("SPY",PRICE_HISTORY_PERIOD)
+    qqq = download_series("QQQ",PRICE_HISTORY_PERIOD)
+    vix = download_series("^VIX",VIX_PERIOD)
+
+    spy_close = spy.iloc[-1]
+    qqq_close = qqq.iloc[-1]
+    vix_close = vix.iloc[-1]
+
+    spy50 = ma(spy,50)
+    spy200 = ma(spy,200)
+
+    qqq50 = ma(qqq,50)
+    qqq200 = ma(qqq,200)
+
+    breadth_data = breadth()
+
+    leaders = leader_status()
+
+    sectors = sector_strength()
+
+    regime = classify(
+        spy_close,
+        spy50,
+        spy200,
+        qqq_close,
+        qqq50,
+        qqq200,
+        vix_close,
+        breadth_data["pct50"],
+        leaders
+    )
+
+    top3 = sectors[:3]
+    bottom3 = sectors[-3:]
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    lines = []
+    lines=[]
 
     lines.append(f"미국 시장 레짐 리포트 ({today})")
     lines.append("")
-
     lines.append(f"시장 판정: {regime}")
     lines.append("")
 
-    lines.append("[지수 상태]")
+    lines.append("[지수 추세]")
 
-    lines.append(
-        f"SPY 50MA {'위' if spy_close>spy50 else '아래'} / 200MA {'위' if spy_close>spy200 else '아래'}"
-    )
-
-    lines.append(
-        f"QQQ 50MA {'위' if qqq_close>qqq50 else '아래'} / 200MA {'위' if qqq_close>qqq200 else '아래'}"
-    )
+    lines.append(f"SPY 현재가 {num(spy_close)}")
+    lines.append(f"50MA {num(spy50)} / 상태 {'충족' if spy_close>spy50 else '미충족'}")
+    lines.append(f"200MA {num(spy200)} / 상태 {'충족' if spy_close>spy200 else '미충족'}")
 
     lines.append("")
-    lines.append("[VIX]")
-    lines.append(f"변동성 지수: {short_number(vix_close)}")
+
+    lines.append(f"QQQ 현재가 {num(qqq_close)}")
+    lines.append(f"50MA {num(qqq50)} / 상태 {'충족' if qqq_close>qqq50 else '미충족'}")
+    lines.append(f"200MA {num(qqq200)} / 상태 {'충족' if qqq_close>qqq200 else '미충족'}")
 
     lines.append("")
-    lines.append("[리더 상태]")
+    lines.append("[시장 Breadth]")
+
+    lines.append(f"S&P500 50MA 위 비율 {pct(breadth_data['pct50'])} ({breadth_data['above50']}/{breadth_data['total']})")
+    lines.append(f"S&P500 200MA 위 비율 {pct(breadth_data['pct200'])} ({breadth_data['above200']}/{breadth_data['total']})")
+
+    lines.append("")
+    lines.append("[신고가 / 신저가]")
+
+    lines.append(f"52주 신고가 {breadth_data['high']}")
+    lines.append(f"52주 신저가 {breadth_data['low']}")
+
+    lines.append("")
+    lines.append("[대표 리더 상태]")
 
     for r in leaders:
 
-        a50txt = "50MA 위" if r["a50"] else "50MA 아래"
-        a200txt = "200MA 위" if r["a200"] else "200MA 아래"
-
         lines.append(
-            f"{r['ticker']} {r['name']} ({r['sector']}) | {a50txt} / {a200txt} | 3M {pct(r['ret3'])}"
+            f"{r['name']} ({r['ticker']}, {r['sector']}) "
+            f"| 50MA {'위' if r['a50'] else '아래'} "
+            f"| 200MA {'위' if r['a200'] else '아래'} "
+            f"| 3M {pct(r['ret3'])}"
         )
 
     lines.append("")
-    lines.append("[리더 구조]")
+    lines.append("[섹터 강도 상위 3개]")
 
-    lines.append(f"200MA 위 리더: {a200} / 11")
-    lines.append(f"50MA 위 리더: {a50} / 11")
-    lines.append(f"3개월 상승 리더: {rpos} / 11")
+    for r in top3:
+        lines.append(f"{r['sector']} ({r['ticker']}) | 3M {pct(r['r3'])} | 6M {pct(r['r6'])}")
 
-    lines.append(leader_comment)
+    lines.append("")
+    lines.append("[섹터 강도 하위 3개]")
+
+    for r in bottom3:
+        lines.append(f"{r['sector']} ({r['ticker']}) | 3M {pct(r['r3'])} | 6M {pct(r['r6'])}")
+
+    lines.append("")
+    lines.append("[VIX]")
+
+    lines.append(f"현재값 {num(vix_close)}")
 
     return "\n".join(lines)
 
 
+# ================================
+# 실행
+# ================================
+
 def main():
 
-    report = build_report()
+    report = build()
 
     send_telegram(report)
 
     print(report)
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
