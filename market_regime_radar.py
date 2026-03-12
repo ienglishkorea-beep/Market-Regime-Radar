@@ -7,9 +7,9 @@ import requests
 import yfinance as yf
 
 
-# ================================
-# 환경 변수
-# ================================
+# =========================================
+# 환경 설정
+# =========================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -23,9 +23,9 @@ RET_6M = 126
 SP500_UNIVERSE_CSV = "data/sp500_universe.csv"
 
 
-# ================================
+# =========================================
 # 섹터 ETF
-# ================================
+# =========================================
 
 SECTOR_ETFS = {
     "반도체": "SMH",
@@ -43,9 +43,9 @@ SECTOR_ETFS = {
 }
 
 
-# ================================
-# 대표 리더 (11섹터)
-# ================================
+# =========================================
+# 대표 리더 (참고용 ONLY)
+# =========================================
 
 LEADERS: Dict[str, Dict] = {
     "MSFT": {"name": "마이크로소프트", "sector": "기술"},
@@ -62,9 +62,9 @@ LEADERS: Dict[str, Dict] = {
 }
 
 
-# ================================
+# =========================================
 # 텔레그램
-# ================================
+# =========================================
 
 def send_telegram(text: str):
 
@@ -83,9 +83,9 @@ def send_telegram(text: str):
     requests.post(url, json=payload, timeout=30)
 
 
-# ================================
+# =========================================
 # 유틸
-# ================================
+# =========================================
 
 def safe_float(x) -> Optional[float]:
 
@@ -132,9 +132,9 @@ def compact(v):
     return f"{v:.2f}"
 
 
-# ================================
+# =========================================
 # 데이터 다운로드
-# ================================
+# =========================================
 
 def download_series(ticker, period):
 
@@ -153,9 +153,9 @@ def download_series(ticker, period):
     return close.dropna()
 
 
-# ================================
+# =========================================
 # 이동평균
-# ================================
+# =========================================
 
 def ma(series, n):
 
@@ -165,9 +165,9 @@ def ma(series, n):
     return safe_float(series.rolling(n).mean().iloc[-1])
 
 
-# ================================
+# =========================================
 # 수익률
-# ================================
+# =========================================
 
 def ret(series, lookback):
 
@@ -183,9 +183,9 @@ def ret(series, lookback):
     return (end/start) - 1
 
 
-# ================================
+# =========================================
 # Breadth
-# ================================
+# =========================================
 
 def get_sp500():
 
@@ -204,8 +204,7 @@ def breadth():
     new_high = 0
     new_low = 0
 
-    closes = {}
-    volumes = {}
+    valid = 0
 
     for t in tickers:
 
@@ -213,45 +212,47 @@ def breadth():
 
             s = download_series(t, PRICE_HISTORY_PERIOD)
 
-            closes[t] = s
+            if len(s) < 200:
+                continue
 
-            if len(s) >= 50:
+            valid += 1
 
-                last = s.iloc[-1]
+            last = s.iloc[-1]
 
-                if last > s.rolling(50).mean().iloc[-1]:
-                    above50 += 1
+            ma50 = s.rolling(50).mean().iloc[-1]
+            ma200 = s.rolling(200).mean().iloc[-1]
 
-                if last > s.rolling(200).mean().iloc[-1]:
-                    above200 += 1
+            if last > ma50:
+                above50 += 1
+
+            if last > ma200:
+                above200 += 1
 
             if len(s) >= 252:
 
-                if s.iloc[-1] >= s[-252:].max():
+                if last >= s[-252:].max():
                     new_high += 1
 
-                if s.iloc[-1] <= s[-252:].min():
+                if last <= s[-252:].min():
                     new_low += 1
 
         except:
             pass
 
-    total = len(closes)
-
     return {
         "above50": above50,
         "above200": above200,
-        "total": total,
+        "valid": valid,
         "high": new_high,
         "low": new_low,
-        "pct50": above50/total if total else None,
-        "pct200": above200/total if total else None
+        "pct50": above50/valid if valid else None,
+        "pct200": above200/valid if valid else None
     }
 
 
-# ================================
-# 리더 분석
-# ================================
+# =========================================
+# 리더 상태 (참고용)
+# =========================================
 
 def leader_status():
 
@@ -259,30 +260,35 @@ def leader_status():
 
     for t, info in LEADERS.items():
 
-        s = download_series(t, PRICE_HISTORY_PERIOD)
+        try:
 
-        close = s.iloc[-1]
+            s = download_series(t, PRICE_HISTORY_PERIOD)
 
-        ma50 = ma(s,50)
-        ma200 = ma(s,200)
+            close = s.iloc[-1]
 
-        r3 = ret(s,RET_3M)
+            ma50 = ma(s,50)
+            ma200 = ma(s,200)
 
-        rows.append({
-            "ticker":t,
-            "name":info["name"],
-            "sector":info["sector"],
-            "a50": close>ma50 if ma50 else False,
-            "a200": close>ma200 if ma200 else False,
-            "ret3":r3
-        })
+            r3 = ret(s,RET_3M)
+
+            rows.append({
+                "ticker":t,
+                "name":info["name"],
+                "sector":info["sector"],
+                "a50": close>ma50 if ma50 else False,
+                "a200": close>ma200 if ma200 else False,
+                "ret3":r3
+            })
+
+        except:
+            pass
 
     return rows
 
 
-# ================================
+# =========================================
 # 섹터 강도
-# ================================
+# =========================================
 
 def sector_strength():
 
@@ -290,56 +296,56 @@ def sector_strength():
 
     for name,t in SECTOR_ETFS.items():
 
-        s = download_series(t,PRICE_HISTORY_PERIOD)
+        try:
 
-        r3 = ret(s,RET_3M)
-        r6 = ret(s,RET_6M)
+            s = download_series(t,PRICE_HISTORY_PERIOD)
 
-        score = (r3 or 0)*0.45 + (r6 or 0)*0.55
+            r3 = ret(s,RET_3M)
+            r6 = ret(s,RET_6M)
 
-        rows.append({
-            "sector":name,
-            "ticker":t,
-            "r3":r3,
-            "r6":r6,
-            "score":score
-        })
+            score = (r3 or 0)*0.45 + (r6 or 0)*0.55
+
+            rows.append({
+                "sector":name,
+                "ticker":t,
+                "r3":r3,
+                "r6":r6,
+                "score":score
+            })
+
+        except:
+            pass
 
     rows.sort(key=lambda x:x["score"],reverse=True)
 
     return rows
 
 
-# ================================
-# 판정
-# ================================
+# =========================================
+# 시장 판정 (리더 제외)
+# =========================================
 
-def classify(spy_close,spy50,spy200,qqq_close,qqq50,qqq200,vix,breadth_pct,leaders):
+def classify(spy_close,spy50,spy200,qqq_close,qqq50,qqq200,vix,breadth_pct):
 
     stop=False
     watch=False
 
-    leader200=sum(1 for r in leaders if r["a200"])
-
-    if breadth_pct is not None and breadth_pct<0.30:
+    if breadth_pct is not None and breadth_pct < 0.30:
         stop=True
 
-    if vix>=30:
+    if vix >= 30:
         stop=True
 
-    if spy_close<spy200 or qqq_close<qqq200:
+    if spy_close < spy200 or qqq_close < qqq200:
         stop=True
 
-    if leader200<=2:
-        stop=True
-
-    if breadth_pct is not None and breadth_pct<0.45:
+    if breadth_pct is not None and breadth_pct < 0.45:
         watch=True
 
-    if vix>=22:
+    if vix >= 22:
         watch=True
 
-    if spy_close<spy50 or qqq_close<qqq50:
+    if spy_close < spy50 or qqq_close < qqq50:
         watch=True
 
     if stop:
@@ -351,9 +357,9 @@ def classify(spy_close,spy50,spy200,qqq_close,qqq50,qqq200,vix,breadth_pct,leade
     return "GO"
 
 
-# ================================
+# =========================================
 # 리포트 생성
-# ================================
+# =========================================
 
 def build():
 
@@ -386,7 +392,6 @@ def build():
         qqq200,
         vix_close,
         breadth_data["pct50"],
-        leaders
     )
 
     top3 = sectors[:3]
@@ -416,8 +421,8 @@ def build():
     lines.append("")
     lines.append("[시장 Breadth]")
 
-    lines.append(f"S&P500 50MA 위 비율 {pct(breadth_data['pct50'])} ({breadth_data['above50']}/{breadth_data['total']})")
-    lines.append(f"S&P500 200MA 위 비율 {pct(breadth_data['pct200'])} ({breadth_data['above200']}/{breadth_data['total']})")
+    lines.append(f"S&P500 50MA 위 비율 {pct(breadth_data['pct50'])} ({breadth_data['above50']}/{breadth_data['valid']})")
+    lines.append(f"S&P500 200MA 위 비율 {pct(breadth_data['pct200'])} ({breadth_data['above200']}/{breadth_data['valid']})")
 
     lines.append("")
     lines.append("[신고가 / 신저가]")
@@ -457,9 +462,9 @@ def build():
     return "\n".join(lines)
 
 
-# ================================
+# =========================================
 # 실행
-# ================================
+# =========================================
 
 def main():
 
