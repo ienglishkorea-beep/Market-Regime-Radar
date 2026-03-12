@@ -30,7 +30,15 @@ SECTOR_ETFS = {
     "유틸리티": "XLU",
 }
 
-WIKI_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+LEADER_TICKERS = {
+    "NVIDIA": "NVDA",
+    "Microsoft": "MSFT",
+    "Amazon": "AMZN",
+    "Meta": "META",
+    "Apple": "AAPL",
+}
+
+SP500_UNIVERSE_CSV = "data/sp500_universe.csv"
 
 
 def send_telegram_message(text: str) -> None:
@@ -45,7 +53,7 @@ def send_telegram_message(text: str) -> None:
         "disable_web_page_preview": True,
     }
 
-    response = requests.post(url, json=payload, timeout=20)
+    response = requests.post(url, json=payload, timeout=30)
     print(f"[TELEGRAM] status={response.status_code} body={response.text[:300]}")
 
 
@@ -95,32 +103,40 @@ def calc_return(series: pd.Series, lookback: int) -> Optional[float]:
     return (end / start) - 1.0
 
 
-def flatten_close(downloaded: pd.DataFrame, ticker: str) -> pd.Series:
+def flatten_field(downloaded: pd.DataFrame, ticker: str, field: str) -> pd.Series:
     if downloaded is None or downloaded.empty:
         return pd.Series(dtype="float64")
 
     if isinstance(downloaded.columns, pd.MultiIndex):
-        if ("Close", ticker) in downloaded.columns:
-            out = downloaded[("Close", ticker)]
-        elif (ticker, "Close") in downloaded.columns:
-            out = downloaded[(ticker, "Close")]
+        if (field, ticker) in downloaded.columns:
+            out = downloaded[(field, ticker)]
+        elif (ticker, field) in downloaded.columns:
+            out = downloaded[(ticker, field)]
         else:
             try:
-                close_block = downloaded.xs("Close", axis=1, level=0)
-                if ticker in close_block.columns:
-                    out = close_block[ticker]
+                field_block = downloaded.xs(field, axis=1, level=0)
+                if ticker in field_block.columns:
+                    out = field_block[ticker]
                 else:
                     return pd.Series(dtype="float64")
             except Exception:
                 return pd.Series(dtype="float64")
     else:
-        if "Close" not in downloaded.columns:
+        if field not in downloaded.columns:
             return pd.Series(dtype="float64")
-        out = downloaded["Close"]
+        out = downloaded[field]
 
     out = pd.to_numeric(out, errors="coerce").dropna()
     out.name = ticker
     return out
+
+
+def flatten_close(downloaded: pd.DataFrame, ticker: str) -> pd.Series:
+    return flatten_field(downloaded, ticker, "Close")
+
+
+def flatten_volume(downloaded: pd.DataFrame, ticker: str) -> pd.Series:
+    return flatten_field(downloaded, ticker, "Volume")
 
 
 def download_close_series(ticker: str, period: str) -> pd.Series:
@@ -139,19 +155,25 @@ def download_close_series(ticker: str, period: str) -> pd.Series:
 
 
 def get_sp500_tickers() -> list[str]:
-    tables = pd.read_html(WIKI_SP500_URL)
-    table = tables[0]
+    if not os.path.exists(SP500_UNIVERSE_CSV):
+        raise FileNotFoundError(f"S&P500 유니버스 파일 없음: {SP500_UNIVERSE_CSV}")
+
+    df = pd.read_csv(SP500_UNIVERSE_CSV)
+    if "ticker" not in df.columns:
+        raise ValueError("sp500_universe.csv에는 ticker 컬럼이 필요")
+
     tickers = (
-        table["Symbol"]
+        df["ticker"]
         .astype(str)
         .str.strip()
+        .str.upper()
         .str.replace(".", "-", regex=False)
         .tolist()
     )
     return sorted(set(tickers))
 
 
-def calculate_breadth_and_high_low() -> dict:
+def calculate_breadth_high_low_adline_volume() -> dict:
     tickers = get_sp500_tickers()
 
     downloaded = yf.download(
@@ -165,10 +187,16 @@ def calculate_breadth_and_high_low() -> dict:
     )
 
     close_map: dict[str, pd.Series] = {}
+    volume_map: dict[str, pd.Series] = {}
+
     for ticker in tickers:
-        series = flatten_close(downloaded, ticker)
-        if len(series) >= 200:
-            close_map[ticker] = series
+        close_series = flatten_close(downloaded, ticker)
+        volume_series = flatten_volume(downloaded, ticker)
+
+        if len(close_series) >= 200:
+            close_map[ticker] = close_series
+            if not volume_series.empty:
+                volume_map[ticker] = volume_series
 
     if not close_map:
         return {
@@ -180,12 +208,20 @@ def calculate_breadth_and_high_low() -> dict:
             "above_200_pct": None,
             "new_high_252": 0,
             "new_low_252": 0,
+            "ad_line_latest": 0,
+            "ad_line_20d_change": None,
+            "up_volume": None,
+            "down_volume": None,
+            "up_down_volume_ratio": None,
         }
 
     above_50 = 0
     above_200 = 0
     new_high_252 = 0
     new_low_252 = 0
+
+    closes_df = pd.DataFrame(close_map).sort_index()
+    volumes_df = pd.DataFrame(volume_map).sort_index()
 
     for series in close_map.values():
         last = safe_float(series.iloc[-1])
@@ -208,6 +244,34 @@ def calculate_breadth_and_high_low() -> dict:
 
     count_valid = len(close_map)
 
+    ad_line_latest = 0
+    ad_line_20d_change = None
+    if not closes_df.empty and len(closes_df) >= 25:
+        adv_decl = closes_df.diff().applymap(
+            lambda x: 1 if pd.notna(x) and x > 0 else (-1 if pd.notna(x) and x < 0 else 0)
+        )
+        daily_ad = adv_decl.sum(axis=1)
+        ad_line = daily_ad.cumsum()
+        ad_line_latest = int(ad_line.iloc[-1])
+        ad_line_20d_change = safe_float(ad_line.iloc[-1] - ad_line.iloc[-21]) if len(ad_line) >= 21 else None
+
+    up_volume = None
+    down_volume = None
+    up_down_volume_ratio = None
+    if not closes_df.empty and not volumes_df.empty and len(closes_df) >= 2:
+        last_close = closes_df.iloc[-1]
+        prev_close = closes_df.iloc[-2]
+        last_volume = volumes_df.iloc[-1].reindex(closes_df.columns)
+
+        up_mask = last_close > prev_close
+        down_mask = last_close < prev_close
+
+        up_volume = safe_float(last_volume[up_mask].sum())
+        down_volume = safe_float(last_volume[down_mask].sum())
+
+        if up_volume is not None and down_volume is not None and down_volume > 0:
+            up_down_volume_ratio = up_volume / down_volume
+
     return {
         "count_total": len(tickers),
         "count_valid": count_valid,
@@ -217,6 +281,11 @@ def calculate_breadth_and_high_low() -> dict:
         "above_200_pct": above_200 / count_valid if count_valid else None,
         "new_high_252": new_high_252,
         "new_low_252": new_low_252,
+        "ad_line_latest": ad_line_latest,
+        "ad_line_20d_change": ad_line_20d_change,
+        "up_volume": up_volume,
+        "down_volume": down_volume,
+        "up_down_volume_ratio": up_down_volume_ratio,
     }
 
 
@@ -247,6 +316,98 @@ def get_sector_strength() -> list[dict]:
     return sorted(rows, key=lambda x: x["score"], reverse=True)
 
 
+def get_leader_health() -> list[dict]:
+    rows = []
+
+    for name, ticker in LEADER_TICKERS.items():
+        series = download_close_series(ticker, PRICE_HISTORY_PERIOD)
+        close = safe_float(series.iloc[-1])
+        ma50 = moving_average(series, 50)
+        ma200 = moving_average(series, 200)
+        ret_3m = calc_return(series, RET_3M_LOOKBACK)
+
+        rows.append(
+            {
+                "name": name,
+                "ticker": ticker,
+                "close": close,
+                "ma50": ma50,
+                "ma200": ma200,
+                "above_50": close is not None and ma50 is not None and close > ma50,
+                "above_200": close is not None and ma200 is not None and close > ma200,
+                "ret_3m": ret_3m,
+            }
+        )
+
+    return rows
+
+
+def interpret_breadth_50(pct: Optional[float]) -> str:
+    if pct is None:
+        return "데이터 부족"
+    if pct >= 0.60:
+        return "시장 내부 강도 양호"
+    if pct >= 0.45:
+        return "보통 수준, 약화 전환 여부 관찰"
+    if pct >= 0.30:
+        return "시장 내부 약화, 선별 필요"
+    return "시장 내부 붕괴 가능성 높음"
+
+
+def interpret_breadth_200(pct: Optional[float]) -> str:
+    if pct is None:
+        return "데이터 부족"
+    if pct >= 0.70:
+        return "장기 추세가 살아 있는 종목이 많음"
+    if pct >= 0.50:
+        return "장기 추세는 유지되지만 폭은 좁아짐"
+    return "장기 추세 종목이 많이 무너진 상태"
+
+
+def interpret_high_low(new_highs: int, new_lows: int) -> str:
+    if new_highs > new_lows * 2:
+        return "리더 확장 국면"
+    if new_highs >= new_lows:
+        return "신고가 우위, 아직 양호"
+    if new_lows > new_highs * 2 and new_lows >= 40:
+        return "내부 붕괴 가능성 높음"
+    return "신고가보다 신저가가 많아 내부 약화 신호"
+
+
+def interpret_ad_line(change_20d: Optional[float]) -> str:
+    if change_20d is None:
+        return "데이터 부족"
+    if change_20d > 0:
+        return "최근 20거래일 기준 상승 종목 누적 우위"
+    if change_20d < 0:
+        return "최근 20거래일 기준 하락 종목 누적 우위"
+    return "최근 20거래일 기준 중립"
+
+
+def interpret_up_down_volume(ratio: Optional[float]) -> str:
+    if ratio is None:
+        return "데이터 부족"
+    if ratio >= 1.3:
+        return "상승 거래량 우위, 자금 유입 양호"
+    if ratio >= 0.8:
+        return "거래량 흐름 중립"
+    return "하락 거래량 우위, 분배 가능성 주의"
+
+
+def interpret_leader_health(rows: list[dict]) -> str:
+    if not rows:
+        return "데이터 부족"
+
+    above_50_count = sum(1 for r in rows if r["above_50"])
+    above_200_count = sum(1 for r in rows if r["above_200"])
+
+    if above_50_count >= 4 and above_200_count >= 5:
+        return "대표 리더 구조 양호"
+    if above_200_count >= 4 and above_50_count >= 2:
+        return "리더는 장기 구조 유지, 단기 흔들림 존재"
+    return "대표 리더 약화, 추세 전환 가능성 주의"
+
+
 def classify_market(
     spy_close: float,
     spy_ma50: Optional[float],
@@ -261,6 +422,9 @@ def classify_market(
     breadth_200_pct: Optional[float],
     new_highs: int,
     new_lows: int,
+    ad_line_20d_change: Optional[float],
+    up_down_volume_ratio: Optional[float],
+    leader_rows: list[dict],
 ) -> tuple[str, str, list[str]]:
     reasons: list[str] = []
 
@@ -271,6 +435,9 @@ def classify_market(
     qqq_above_50 = qqq_ma50 is not None and qqq_close > qqq_ma50
     qqq_above_200 = qqq_ma200 is not None and qqq_close > qqq_ma200
     qqq_50_above_200 = qqq_ma50 is not None and qqq_ma200 is not None and qqq_ma50 > qqq_ma200
+
+    leader_above_50_count = sum(1 for r in leader_rows if r["above_50"])
+    leader_above_200_count = sum(1 for r in leader_rows if r["above_200"])
 
     stop = False
     caution = False
@@ -313,6 +480,21 @@ def classify_market(
         reasons.append("신저가 종목 수가 신고가 종목 수보다 많음")
         caution = True
 
+    if ad_line_20d_change is not None and ad_line_20d_change < 0:
+        reasons.append("A/D Line 20거래일 변화가 음수")
+        caution = True
+
+    if up_down_volume_ratio is not None and up_down_volume_ratio < 0.8:
+        reasons.append("하락 거래량 우위")
+        caution = True
+
+    if leader_above_200_count <= 2:
+        reasons.append("대표 리더 다수가 200일선 아래")
+        stop = True
+    elif leader_above_50_count <= 2:
+        reasons.append("대표 리더 다수가 50일선 아래")
+        caution = True
+
     if vix_close >= 30:
         reasons.append("VIX가 30 이상으로 변동성 매우 높음")
         stop = True
@@ -350,8 +532,9 @@ def build_message() -> str:
     spy_ret_6m = calc_return(spy, RET_6M_LOOKBACK)
     qqq_ret_6m = calc_return(qqq, RET_6M_LOOKBACK)
 
-    breadth = calculate_breadth_and_high_low()
+    breadth = calculate_breadth_high_low_adline_volume()
     sector_rows = get_sector_strength()
+    leader_rows = get_leader_health()
 
     regime, action, reasons = classify_market(
         spy_close=spy_close,
@@ -367,6 +550,9 @@ def build_message() -> str:
         breadth_200_pct=breadth["above_200_pct"],
         new_highs=breadth["new_high_252"],
         new_lows=breadth["new_low_252"],
+        ad_line_20d_change=breadth["ad_line_20d_change"],
+        up_down_volume_ratio=breadth["up_down_volume_ratio"],
+        leader_rows=leader_rows,
     )
 
     trading_dates = latest_trading_dates(spy, 3)
@@ -399,17 +585,42 @@ def build_message() -> str:
         "",
         "시장 Breadth",
         f"- S&P500 50일선 위 종목 비율: {pct_text(breadth['above_50_pct'])} ({breadth['above_50']}/{breadth['count_valid']})",
+        f"- 해석: {interpret_breadth_50(breadth['above_50_pct'])}",
         f"- S&P500 200일선 위 종목 비율: {pct_text(breadth['above_200_pct'])} ({breadth['above_200']}/{breadth['count_valid']})",
-        "- 한글 해석: 50일선 위 종목 비율은 시장 내부 강도를 뜻함",
-        "- 한글 해석: 200일선 위 종목 비율은 장기적으로 살아있는 종목 비중을 뜻함",
+        f"- 해석: {interpret_breadth_200(breadth['above_200_pct'])}",
         "",
         "신고가 / 신저가",
         f"- 52주 신고가 종목 수: {breadth['new_high_252']}",
         f"- 52주 신저가 종목 수: {breadth['new_low_252']}",
-        "- 한글 해석: 신고가가 많으면 리더 확장, 신저가가 많으면 내부 붕괴 신호",
+        f"- 해석: {interpret_high_low(breadth['new_high_252'], breadth['new_low_252'])}",
         "",
-        "섹터 강도 상위 3개",
+        "A/D Line",
+        f"- 현재 누적값: {breadth['ad_line_latest']}",
+        f"- 최근 20거래일 변화: {num_text(breadth['ad_line_20d_change'])}",
+        f"- 해석: {interpret_ad_line(breadth['ad_line_20d_change'])}",
+        "",
+        "상승 거래량 / 하락 거래량",
+        f"- 상승 거래량: {num_text(breadth['up_volume'])}",
+        f"- 하락 거래량: {num_text(breadth['down_volume'])}",
+        f"- 비율(상승/하락): {num_text(breadth['up_down_volume_ratio'])}",
+        f"- 해석: {interpret_up_down_volume(breadth['up_down_volume_ratio'])}",
+        "",
+        "대표 리더 상태",
     ]
+
+    for row in leader_rows:
+        lines.append(
+            f"- {row['name']} ({row['ticker']}) | 50일선 위 {bool_text(row['above_50'])} | "
+            f"200일선 위 {bool_text(row['above_200'])} | 최근 3개월 {pct_text(row['ret_3m'])}"
+        )
+
+    lines.extend(
+        [
+            f"- 종합 해석: {interpret_leader_health(leader_rows)}",
+            "",
+            "섹터 강도 상위 3개",
+        ]
+    )
 
     for row in top3:
         lines.append(
@@ -428,7 +639,7 @@ def build_message() -> str:
             "",
             "VIX",
             f"- 현재값: {num_text(vix_close)}",
-            "- 한글 해석: VIX가 높을수록 시장 변동성이 크고 돌파 실패 위험이 커짐",
+            "- 해석: VIX가 높을수록 변동성이 크고 돌파 실패 위험이 커짐",
             "",
             "최종 판정",
             f"- 시장 레짐: {regime}",
