@@ -3,7 +3,7 @@ name: market-regime-radar
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 23 * * 0-4"
+    - cron: "17 23 * * 0-4"
 
 jobs:
   run:
