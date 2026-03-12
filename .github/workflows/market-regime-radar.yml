@@ -3,7 +3,7 @@ name: market-regime-radar
 on:
   workflow_dispatch:
   schedule:
-    - cron: "50 21 * * 1-5"
+    - cron: "0 23 * * 0-4"
 
 jobs:
   run:
@@ -21,7 +21,7 @@ jobs:
       - name: 라이브러리 설치
         run: |
           python -m pip install --upgrade pip
-          pip install yfinance pandas requests
+          pip install yfinance pandas requests lxml html5lib
 
       - name: 시장 레짐 리포트 실행
         env:
